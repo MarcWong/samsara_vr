@@ -16,13 +16,34 @@
 import * as THREE from 'three';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
 
-// [shadow, mid, highlight]. Lifted well above the original SUMMARY palette
-// (#0e1c2e / #2c4a57 / #bcdce8): the deep teal shadows read as a dark
-// stairwell wall, which is right behind a results panel but wrong when the
-// field is all there is around you. Here the darkest stop is only a
-// blue-grey cloud underside, the mid is a lit cloud face and the highlight
-// is sun-through-haze white, so the same flow reads as drifting in cloud.
-const PALETTE = ['#6c8ba0', '#b3cbd8', '#f3f8fb'];
+// Each entry is [shadow, mid, highlight]. All lifted well above the
+// original SUMMARY palette (#0e1c2e / #2c4a57 / #bcdce8): the deep teal
+// shadows read as a dark stairwell wall, right behind a results panel but
+// wrong when the field is all there is around you. Here the darkest stop
+// is only a cloud underside, the mid a lit cloud face, the highlight
+// sun-through-haze white, so the same flow reads as drifting in cloud.
+//
+// The tint of that cloud is what changes over time: the shadow and mid
+// stops carry the colour of the ground seen from orbit -- open ocean,
+// shallows, forest, savanna, desert -- while the highlight stays close to
+// white with only a whisper of the same hue. Ordered by hue so each
+// neighbour crossfade stays clean (blue -> teal -> green -> yellow-green
+// -> ochre); the sequence ping-pongs rather than loops because a direct
+// desert -> ocean blend passes through a muddy grey.
+// Highlights stop short of white on purpose: a paper-white top stop
+// filled too much of the dome and read as glare, so each is a pale tint of
+// its own hue, and the shadow/mid stops sit a step darker to match.
+const PALETTES = [
+	['#2f5677', '#6f97b6', '#c9dceb'], // open ocean
+	['#317072', '#78aba8', '#c8e2df'], // shallows / reef
+	['#3f6644', '#82a87e', '#cfe0ca'], // forest
+	['#767f3d', '#adb37a', '#e3e4c2'], // savanna
+	['#96703a', '#c5a577', '#ecdfc4'], // desert
+];
+// Seconds each terrain holds before the next crossfade, and the length of
+// the crossfade itself.
+const PALETTE_HOLD = 5;
+const PALETTE_FADE = 10;
 
 // Raw 0..1 channels, NOT THREE.Color: with colour management on, Color
 // would linearise these sRGB hex values and the whole dome comes out dark
@@ -33,8 +54,17 @@ function hexToRgb(hex) {
 	return new THREE.Vector3(((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255);
 }
 
-// Rate the gaze target is chased per frame; the original mouse easing.
-const GAZE_EASE = 0.06;
+// The pull point is not a single eased gaze any more but a chain of
+// followers: link 0 chases the head, link 1 chases link 0, and so on. The
+// chain lags behind a turn and settles back along the path the head took,
+// so the sand is drawn toward where you have been looking as well as
+// where you look now -- a wake rather than a spotlight. Each link chases
+// the one ahead at GAZE_EASE per frame (the original mouse easing was
+// 0.06; slower here, since the lag is the point). TRAIL_DECAY is how much
+// less each link back pulls than the one in front.
+const TRAIL_LENGTH = 8;
+const GAZE_EASE = 0.035;
+const TRAIL_DECAY = 0.78;
 
 // The dome is a screen's worth of fbm at VR resolution x2 eyes, and the
 // look is grainy by design, so rendering below native and letting the
@@ -54,8 +84,11 @@ const vertex = /* glsl */ `
 const fragment = /* glsl */ `
 	precision highp float;
 
+	#define TRAIL_LENGTH ${TRAIL_LENGTH}
+
 	uniform float uTime;
-	uniform vec3 uGaze;
+	uniform vec3 uTrail[TRAIL_LENGTH];
+	uniform float uTrailWeight[TRAIL_LENGTH];
 	uniform vec3 uColorDark;
 	uniform vec3 uColorMid;
 	uniform vec3 uColorLight;
@@ -106,12 +139,21 @@ const fragment = /* glsl */ `
 
 	void main() {
 		vec3 dir = normalize(vDir);
-		vec3 gaze = normalize(uGaze);
 
-		// angular distance from where the head is looking pulls the flow
-		// field toward it, like a hand dragged through sand
-		float d = acos(clamp(dot(dir, gaze), -1.0, 1.0));
-		float pull = smoothstep(0.6, 0.0, d);
+		// angular distance from each point along the recent gaze path pulls
+		// the flow field toward it, like a hand dragged through sand: the
+		// current gaze pulls hardest, older links along the path less, so
+		// a turn of the head leaves a wake that closes up behind it
+		float pull = 0.0;
+		vec3 drag = vec3(0.0);
+		for (int i = 0; i < TRAIL_LENGTH; i++) {
+			vec3 g = normalize(uTrail[i]);
+			float d = acos(clamp(dot(dir, g), -1.0, 1.0));
+			float p = smoothstep(0.6, 0.0, d) * uTrailWeight[i];
+			pull += p;
+			drag += (dir - g) * p;
+		}
+		pull = min(pull, 1.0);
 
 		vec3 flow = dir * 3.0;
 		// Which patch of the lattice the dome starts on decides how the
@@ -119,8 +161,10 @@ const fragment = /* glsl */ `
 		// cells). This offset was searched so the forward view opens with
 		// the same dark/light balance the screen version had at t=0.
 		flow += vec3(11.9, 11.7, 0.0);
-		flow += vec3(uTime * 0.03, uTime * 0.02, 0.0);
-		flow += (dir - gaze) * pull * 1.5;
+		// slower than the original 0.03 / 0.02: with the wake carrying the
+		// motion, the field itself only needs to breathe
+		flow += vec3(uTime * 0.018, uTime * 0.012, 0.0);
+		flow += drag * 1.5;
 
 		float n = fbm(flow);
 		n += fbm(flow * 2.0 + 10.0) * 0.5;
@@ -143,8 +187,11 @@ const fragment = /* glsl */ `
 		// Wider, overlapping ramps than the original's (0.2-0.6, 0.55-0.85):
 		// cloud has no hard shadow line, so shadow-to-mid and mid-to-light
 		// both spread across most of the range and blend into each other.
+		// The light ramp starts later and the gaze bonus is smaller than
+		// before (0.62-0.95 and 0.25): the highlight should be the crest
+		// of a cloud, not the bulk of it.
 		vec3 color = mix(uColorDark, uColorMid, smoothstep(0.35, 0.75, n));
-		color = mix(color, uColorLight, smoothstep(0.62, 0.95, n + pull * 0.25));
+		color = mix(color, uColorLight, smoothstep(0.72, 1.0, n + pull * 0.18));
 		// Faint cool tint in the shadow undersides, so they read as blue
 		// sky showing through rather than grey.
 		color = mix(color, color * vec3(0.97, 0.99, 1.03), 1.0 - smoothstep(0.35, 0.75, n));
@@ -172,11 +219,41 @@ const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerH
 
 const uniforms = {
 	uTime: { value: 0 },
-	uGaze: { value: new THREE.Vector3(0, 0, -1) },
-	uColorDark: { value: hexToRgb(PALETTE[0]) },
-	uColorMid: { value: hexToRgb(PALETTE[1]) },
-	uColorLight: { value: hexToRgb(PALETTE[2]) },
+	uTrail: { value: Array.from({ length: TRAIL_LENGTH }, () => new THREE.Vector3(0, 0, -1)) },
+	uTrailWeight: { value: Array.from({ length: TRAIL_LENGTH }, (_, i) => Math.pow(TRAIL_DECAY, i)) },
+	uColorDark: { value: new THREE.Vector3() },
+	uColorMid: { value: new THREE.Vector3() },
+	uColorLight: { value: new THREE.Vector3() },
 };
+
+// ---------------------------------------------------------------------------
+// Palette drift
+// ---------------------------------------------------------------------------
+
+const PALETTE_RGB = PALETTES.map(p => p.map(hexToRgb));
+// 0 1 2 3 4 3 2 1, then repeat -- see the note on PALETTES for why.
+const PALETTE_ORDER = [
+	...PALETTES.map((_, i) => i),
+	...PALETTES.map((_, i) => i).slice(1, -1).reverse(),
+];
+const PALETTE_SEGMENT = PALETTE_HOLD + PALETTE_FADE;
+const _stop = new THREE.Vector3();
+
+function updatePalette(seconds) {
+	const seg = Math.floor(seconds / PALETTE_SEGMENT);
+	const phase = seconds - seg * PALETTE_SEGMENT;
+	const from = PALETTE_RGB[PALETTE_ORDER[seg % PALETTE_ORDER.length]];
+	const to = PALETTE_RGB[PALETTE_ORDER[(seg + 1) % PALETTE_ORDER.length]];
+	// smoothstep across the fade so the hold on either side eases in and
+	// out instead of the tint visibly starting and stopping.
+	let t = THREE.MathUtils.clamp((phase - PALETTE_HOLD) / PALETTE_FADE, 0, 1);
+	t = t * t * (3 - 2 * t);
+	const targets = [uniforms.uColorDark, uniforms.uColorMid, uniforms.uColorLight];
+	for (let i = 0; i < 3; i++) {
+		targets[i].value.copy(from[i]).lerp(_stop.copy(to[i]), t);
+	}
+}
+updatePalette(0);
 
 const dome = new THREE.Mesh(
 	new THREE.SphereGeometry(20, 48, 32),
@@ -202,7 +279,7 @@ scene.add(dome);
 // ---------------------------------------------------------------------------
 
 const gazeTarget = new THREE.Vector3(0, 0, -1);
-const gazeEased = new THREE.Vector3(0, 0, -1);
+const trail = uniforms.uTrail.value;
 const headPos = new THREE.Vector3();
 
 const orient = {
@@ -282,12 +359,16 @@ renderer.setAnimationLoop(() => {
 	head.getWorldPosition(headPos);
 	dome.position.copy(headPos);
 
-	// same chase the mouse point had, done on the direction vector
-	gazeEased.lerp(gazeTarget, GAZE_EASE).normalize();
+	// each link chases the one ahead of it; the head leads the chain
+	let ahead = gazeTarget;
+	for (let i = 0; i < TRAIL_LENGTH; i++) {
+		trail[i].lerp(ahead, GAZE_EASE).normalize();
+		ahead = trail[i];
+	}
 
 	timer.update();
 	uniforms.uTime.value = timer.getElapsed();
-	uniforms.uGaze.value.copy(gazeEased);
+	updatePalette(uniforms.uTime.value);
 
 	renderer.render(scene, camera);
 });

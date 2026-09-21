@@ -7,6 +7,11 @@ Only the visual effect is carried over — no game logic, text, or UI.
 The pull point that used to follow the mouse now follows **head orientation**:
 look somewhere and the sand there is drawn toward your gaze.
 
+The tint drifts over time through satellite-view terrain colours (open ocean
+→ shallows → forest → savanna → desert and back), holding each for 5 s and
+crossfading over 10 s. See `PALETTES`, `PALETTE_HOLD`, `PALETTE_FADE` in
+`sand.js`.
+
 ## Run
 
 Any static server works. WebXR needs a secure context (`https://` or
