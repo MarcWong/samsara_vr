@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+	<title>Flowing Sand — WebXR</title>
+	<style>
+		html, body { margin: 0; height: 100%; overflow: hidden; background: #0d1620; }
+		canvas { display: block; }
+		/* Shown only while the WebGL context has not come up yet (or when it
+		   fails), so the first frame is never a flash of white. Same fallback
+		   gradient the original screen used. */
+		#fallback {
+			position: fixed; inset: 0; z-index: -1;
+			background: radial-gradient(circle at 50% 0%, #24404d, #0d1620 70%);
+		}
+		/* One-tap gate for phones that require a gesture before handing out
+		   DeviceOrientation (iOS). Hidden unless it is actually needed. */
+		#orient {
+			position: fixed; left: 50%; bottom: 96px; transform: translateX(-50%);
+			padding: 12px 18px; border: 1px solid rgba(220, 232, 238, 0.5);
+			border-radius: 4px; background: rgba(13, 22, 32, 0.6);
+			color: #dce8ee; font: 13px/1 system-ui, sans-serif; letter-spacing: 0.04em;
+			cursor: pointer; display: none;
+		}
+	</style>
+	<script type="importmap">
+	{
+		"imports": {
+			"three": "https://cdn.jsdelivr.net/npm/three@0.185.1/build/three.module.js",
+			"three/addons/": "https://cdn.jsdelivr.net/npm/three@0.185.1/examples/jsm/"
+		}
+	}
+	</script>
+</head>
+<body>
+	<div id="fallback"></div>
+	<button id="orient" type="button">Enable head tracking</button>
+	<script type="module" src="./sand.js"></script>
+</body>
+</html>
