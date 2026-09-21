@@ -12,6 +12,18 @@
 //     which keeps the original 0.6 falloff radius meaningful (~34 degrees).
 // Everything else -- drift speed, octave layout, grain, palette and the
 // three-stop colour mix -- is the same as the original.
+//
+// Rendering is split in two passes, and that split is what keeps a Quest
+// alive. Evaluating ten octaves of 3D noise per eye pixel (x8 trail
+// points) came to ~4.5M heavy fragments a frame at native resolution;
+// the Quest browser first dropped its render scale to stay at 72Hz (the
+// dome went blurry) and then the GPU watchdog killed the tab. So:
+//   1. FIELD pass: the noise/colour is computed once per frame into a
+//      small equirectangular texture (FIELD_WIDTH x FIELD_HEIGHT) that
+//      covers the whole sphere of directions.
+//   2. DOME pass: what the headset actually rasterises is one texture
+//      lookup per pixel plus the film grain, which is added here so it
+//      stays at native pixel size and does not upscale into blotches.
 
 import * as THREE from 'three';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
@@ -66,22 +78,24 @@ const TRAIL_LENGTH = 8;
 const GAZE_EASE = 0.035;
 const TRAIL_DECAY = 0.78;
 
-// The dome is a screen's worth of fbm at VR resolution x2 eyes, and the
-// look is grainy by design, so rendering below native and letting the
-// compositor upscale costs nothing visible.
-const XR_FRAMEBUFFER_SCALE = 0.8;
+// Equirect field texture. 1536x768 is ~1.2M heavy fragments a frame,
+// about a quarter of the direct-to-eye cost, and the field is soft enough
+// (finest octave ~12 texels at this size) that the eye pass upscaling it
+// 4-5x is invisible under the grain.
+const FIELD_WIDTH = 1536;
+const FIELD_HEIGHT = 768;
 
-const vertex = /* glsl */ `
-	varying vec3 vDir;
+// --- FIELD pass: full-screen triangle into the equirect texture ---------
+
+const fieldVertex = /* glsl */ `
+	varying vec2 vUv;
 	void main() {
-		// Sphere is centred on the head and never rotated, so the object-space
-		// vertex direction is the world-space view direction of that texel.
-		vDir = position;
-		gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+		vUv = uv;
+		gl_Position = vec4(position.xy, 0.0, 1.0);
 	}
 `;
 
-const fragment = /* glsl */ `
+const fieldFragment = /* glsl */ `
 	precision highp float;
 
 	#define TRAIL_LENGTH ${TRAIL_LENGTH}
@@ -93,13 +107,7 @@ const fragment = /* glsl */ `
 	uniform vec3 uColorMid;
 	uniform vec3 uColorLight;
 
-	varying vec3 vDir;
-
-	float hash(vec2 p) {
-		p = fract(p * vec2(123.34, 456.21));
-		p += dot(p, p + 45.32);
-		return fract(p.x * p.y);
-	}
+	varying vec2 vUv;
 
 	float hash3(vec3 p) {
 		p = fract(p * vec3(123.34, 456.21, 789.12));
@@ -138,7 +146,12 @@ const fragment = /* glsl */ `
 	}
 
 	void main() {
-		vec3 dir = normalize(vDir);
+		// texel -> world direction; u wraps around the horizon, v runs
+		// pole to pole. u = 0.5 is straight ahead (-Z), matching the
+		// lookup in the dome pass.
+		float lon = (vUv.x - 0.5) * 6.28318530718;
+		float lat = (vUv.y - 0.5) * 3.14159265359;
+		vec3 dir = vec3(cos(lat) * sin(lon), sin(lat), -cos(lat) * cos(lon));
 
 		// angular distance from each point along the recent gaze path pulls
 		// the flow field toward it, like a hand dragged through sand: the
@@ -180,10 +193,6 @@ const fragment = /* glsl */ `
 		float sky = dir.y * 0.5 + 0.5;
 		n += (sky - 0.5) * 0.12;
 
-		// Half the original grain; on a pale field the full 0.04 reads as
-		// dust rather than the texture it gave the dark version.
-		float grain = (hash(gl_FragCoord.xy + uTime) - 0.5) * 0.02;
-
 		// Wider, overlapping ramps than the original's (0.2-0.6, 0.55-0.85):
 		// cloud has no hard shadow line, so shadow-to-mid and mid-to-light
 		// both spread across most of the range and blend into each other.
@@ -195,7 +204,50 @@ const fragment = /* glsl */ `
 		// Faint cool tint in the shadow undersides, so they read as blue
 		// sky showing through rather than grey.
 		color = mix(color, color * vec3(0.97, 0.99, 1.03), 1.0 - smoothstep(0.35, 0.75, n));
-		color += grain;
+
+		gl_FragColor = vec4(color, 1.0);
+	}
+`;
+
+// --- DOME pass: what the eyes see -----------------------------------------
+
+const domeVertex = /* glsl */ `
+	varying vec3 vDir;
+	void main() {
+		// Sphere is centred on the head and never rotated, so the object-space
+		// vertex direction is the world-space view direction of that texel.
+		vDir = position;
+		gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+	}
+`;
+
+const domeFragment = /* glsl */ `
+	precision highp float;
+
+	uniform sampler2D uField;
+	uniform float uTime;
+
+	varying vec3 vDir;
+
+	float hash(vec2 p) {
+		p = fract(p * vec2(123.34, 456.21));
+		p += dot(p, p + 45.32);
+		return fract(p.x * p.y);
+	}
+
+	void main() {
+		vec3 dir = normalize(vDir);
+		// inverse of the field pass mapping; the texture wraps in u so the
+		// atan seam at +-PI is invisible
+		vec2 uv = vec2(
+			atan(dir.x, -dir.z) / 6.28318530718 + 0.5,
+			asin(clamp(dir.y, -1.0, 1.0)) / 3.14159265359 + 0.5
+		);
+		vec3 color = texture2D(uField, uv).rgb;
+
+		// Half the original grain; on a pale field the full 0.04 reads as
+		// dust rather than the texture it gave the dark version.
+		color += (hash(gl_FragCoord.xy + uTime) - 0.5) * 0.02;
 
 		gl_FragColor = vec4(color, 1.0);
 	}
@@ -209,7 +261,6 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
 renderer.xr.enabled = true;
 renderer.xr.setReferenceSpaceType('local');
-renderer.xr.setFramebufferScaleFactor(XR_FRAMEBUFFER_SCALE);
 document.body.appendChild(renderer.domElement);
 document.body.appendChild(VRButton.createButton(renderer));
 document.getElementById('fallback').remove();
@@ -255,12 +306,37 @@ function updatePalette(seconds) {
 }
 updatePalette(0);
 
+const fieldTarget = new THREE.WebGLRenderTarget(FIELD_WIDTH, FIELD_HEIGHT, {
+	depthBuffer: false,
+	stencilBuffer: false,
+	wrapS: THREE.RepeatWrapping,
+	wrapT: THREE.ClampToEdgeWrapping,
+	minFilter: THREE.LinearFilter,
+	magFilter: THREE.LinearFilter,
+	generateMipmaps: false,
+});
+const fieldScene = new THREE.Scene();
+const fieldCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+fieldScene.add(new THREE.Mesh(
+	new THREE.PlaneGeometry(2, 2),
+	new THREE.ShaderMaterial({
+		vertexShader: fieldVertex,
+		fragmentShader: fieldFragment,
+		uniforms,
+		depthWrite: false,
+		depthTest: false,
+	})
+));
+
 const dome = new THREE.Mesh(
 	new THREE.SphereGeometry(20, 48, 32),
 	new THREE.ShaderMaterial({
-		vertexShader: vertex,
-		fragmentShader: fragment,
-		uniforms,
+		vertexShader: domeVertex,
+		fragmentShader: domeFragment,
+		uniforms: {
+			uField: { value: fieldTarget.texture },
+			uTime: uniforms.uTime,
+		},
 		side: THREE.BackSide,
 		depthWrite: false,
 		depthTest: false,
@@ -369,6 +445,18 @@ renderer.setAnimationLoop(() => {
 	timer.update();
 	uniforms.uTime.value = timer.getElapsed();
 	updatePalette(uniforms.uTime.value);
+
+	// Field pass. While presenting, render() swaps in the XR array camera
+	// (two viewports) for whatever camera it is handed, which would split
+	// the equirect texture in half -- so XR is switched off around this
+	// one draw and the XR render target restored afterwards.
+	const xrWasEnabled = renderer.xr.enabled;
+	const eyeTarget = renderer.getRenderTarget();
+	renderer.xr.enabled = false;
+	renderer.setRenderTarget(fieldTarget);
+	renderer.render(fieldScene, fieldCamera);
+	renderer.setRenderTarget(eyeTarget);
+	renderer.xr.enabled = xrWasEnabled;
 
 	renderer.render(scene, camera);
 });
