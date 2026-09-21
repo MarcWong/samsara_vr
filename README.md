@@ -12,7 +12,12 @@ The tint drifts over time through satellite-view terrain colours (open ocean
 crossfading over 10 s. See `PALETTES`, `PALETTE_HOLD`, `PALETTE_FADE` in
 `sand.js`.
 
-## Run
+## Live
+
+https://marcwong.github.io/samsara_vr/ — served over https, so it opens
+directly in a headset browser.
+
+## Run locally
 
 Any static server works. WebXR needs a secure context (`https://` or
 `localhost`):
