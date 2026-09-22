@@ -71,10 +71,12 @@ const GAZE_EASE = 0.035;
 const TRAIL_DECAY = 0.78;
 
 const MOBILE = /Quest|Oculus|Android|Mobile/i.test(navigator.userAgent);
-const FIELD_WIDTH = MOBILE ? 1024 : 2048;
+const FIELD_WIDTH = MOBILE ? 1536 : 2048;
 const FIELD_HEIGHT = FIELD_WIDTH / 2;
-const FIELD_HZ = MOBILE ? 24 : 36;
-const FIELD_OCTAVES = MOBILE ? 4 : 5;
+// Only one strip is shaded per frame, even during startup and recovery.
+// Quest: 1536 * 128 = 196608 heavy pixels, versus 524288 in the black-screen fix.
+const FIELD_STRIPS = MOBILE ? 6 : 4;
+const FIELD_OCTAVES = 5;
 
 // --- FIELD pass: full-screen triangle into the equirect texture ---------
 
@@ -109,7 +111,7 @@ const fieldFragment = /* glsl */ `
 	float noise(vec3 p) {
 		vec3 i = floor(p);
 		vec3 f = fract(p);
-		vec3 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+		vec3 u = f * f * (3.0 - 2.0 * f);
 		float n000 = hash3(i);
 		float n100 = hash3(i + vec3(1.0, 0.0, 0.0));
 		float n010 = hash3(i + vec3(0.0, 1.0, 0.0));
@@ -128,9 +130,15 @@ const fieldFragment = /* glsl */ `
 	float fbm(vec3 p) {
 		float value = 0.0;
 		float amplitude = 0.5;
+		float footprint = max(length(dFdx(p)), length(dFdy(p)));
 		for (int i = 0; i < ${FIELD_OCTAVES}; i++) {
-			value += amplitude * noise(p);
+			// Keep the reference's five octaves and their average brightness.
+			// Fade only frequencies the field texels cannot resolve, notably
+			// in the compressed gaze wake. Dropping them darkens the cloud.
+			float resolved = 1.0 - smoothstep(0.35, 0.85, footprint);
+			value += amplitude * mix(0.5, noise(p), resolved);
 			p *= 2.0;
+			footprint *= 2.0;
 			amplitude *= 0.5;
 		}
 		return value;
@@ -152,8 +160,9 @@ const fieldFragment = /* glsl */ `
 		vec3 drag = vec3(0.0);
 		for (int i = 0; i < TRAIL_LENGTH; i++) {
 			vec3 g = uTrail[i];
-			// Ordered edges are required by GLSL; cosine avoids eight acos calls.
-			float p = smoothstep(0.8253356, 1.0, dot(dir, g)) * uTrailWeight[i];
+			// Restore ef18a44's angular falloff, with defined smoothstep edges.
+			float d = acos(clamp(dot(dir, g), -1.0, 1.0));
+			float p = (1.0 - smoothstep(0.0, 0.6, d)) * uTrailWeight[i];
 			pull += p;
 			drag += (dir - g) * p;
 		}
@@ -217,6 +226,9 @@ const domeFragment = /* glsl */ `
 	precision highp float;
 
 	uniform sampler2D uField;
+	uniform sampler2D uPreviousField;
+	uniform vec2 uFieldSize;
+	uniform float uFieldBlend;
 	uniform float uTime;
 
 	varying highp vec3 vDir;
@@ -227,6 +239,29 @@ const domeFragment = /* glsl */ `
 		return fract(p.x * p.y);
 	}
 
+	// Cubic B-spline reconstruction: four hardware-bilinear reads replace
+	// a 16-texel kernel (GPU Gems 2, chapter 20). RepeatWrapping preserves
+	// continuity at the longitude seam. Positive weights avoid ringing.
+	vec3 sampleField(sampler2D tex, vec2 uv) {
+		vec2 p = uv * uFieldSize - 0.5;
+		vec2 base = floor(p);
+		vec2 f = fract(p);
+		vec2 f2 = f * f;
+		vec2 f3 = f2 * f;
+		vec2 w0 = (1.0 - 3.0*f + 3.0*f2 - f3) / 6.0;
+		vec2 w1 = (4.0 - 6.0*f2 + 3.0*f3) / 6.0;
+		vec2 w2 = (1.0 + 3.0*f + 3.0*f2 - 3.0*f3) / 6.0;
+		vec2 w3 = f3 / 6.0;
+		vec2 g0 = w0 + w1;
+		vec2 g1 = w2 + w3;
+		vec2 a = (base - 0.5 + w1 / g0) / uFieldSize;
+		vec2 b = (base + 1.5 + w3 / g1) / uFieldSize;
+		return mix(
+			mix(texture2D(tex, a).rgb, texture2D(tex, vec2(b.x, a.y)).rgb, g1.x),
+			mix(texture2D(tex, vec2(a.x, b.y)).rgb, texture2D(tex, b).rgb, g1.x),
+			g1.y);
+	}
+
 	void main() {
 		vec3 dir = normalize(vDir);
 		// inverse of the field pass mapping; the texture wraps in u so the
@@ -235,16 +270,12 @@ const domeFragment = /* glsl */ `
 			atan(dir.x, -dir.z) / 6.28318530718 + 0.5,
 			asin(clamp(dir.y, -1.0, 1.0)) / 3.14159265359 + 0.5
 		);
-		vec3 color = texture2D(uField, uv).rgb;
-
-		// Stable world-space microtexture: both eyes see the same detail,
-		// rather than unrelated, sparkling screen-space noise.
-		vec3 p = dir * 700.0;
-		float footprint = max(length(dFdx(p)), length(dFdy(p)));
-		float detail = sin(p.x + sin(p.z)) * sin(p.y - p.z);
-		color += detail * 0.009 * (1.0 - smoothstep(0.5, 2.0, footprint));
-		// Subtle quantization dither, below a single 8-bit step.
-		color += (hash(gl_FragCoord.xy) - 0.5) / 255.0;
+		// Only complete snapshots are shown; the texture under construction
+		// is never sampled by either eye. Interpolation runs every eye frame.
+		vec3 color = mix(sampleField(uPreviousField, uv), sampleField(uField, uv), uFieldBlend);
+		// Restore an organic, low-amplitude grain instead of periodic sine
+		// stripes. Grain is added after reconstruction, never magnified.
+		color += (hash(gl_FragCoord.xy + uTime) - 0.5) * 0.008;
 
 		gl_FragColor = vec4(color, 1.0);
 	}
@@ -258,10 +289,10 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
 renderer.xr.enabled = true;
 renderer.xr.setReferenceSpaceType('local');
-// Configure before entering XR. Keep modest peripheral savings without
-// the conspicuous blocks of maximum fixed foveation.
-renderer.xr.setFramebufferScaleFactor(MOBILE ? 0.85 : 1);
-renderer.xr.setFoveation(MOBILE ? 0.35 : 0);
+// The expensive field is budgeted separately. Preserve eye resolution
+// and avoid foveation tile boundaries across this smooth, continuous sky.
+renderer.xr.setFramebufferScaleFactor(1);
+renderer.xr.setFoveation(0);
 document.body.appendChild(renderer.domElement);
 document.body.appendChild(VRButton.createButton(renderer));
 const fallback = document.getElementById('fallback');
@@ -308,7 +339,7 @@ function updatePalette(seconds) {
 }
 updatePalette(0);
 
-const fieldTarget = new THREE.WebGLRenderTarget(FIELD_WIDTH, FIELD_HEIGHT, {
+const createFieldTarget = () => new THREE.WebGLRenderTarget(FIELD_WIDTH, FIELD_HEIGHT, {
 	depthBuffer: false,
 	stencilBuffer: false,
 	wrapS: THREE.RepeatWrapping,
@@ -317,6 +348,14 @@ const fieldTarget = new THREE.WebGLRenderTarget(FIELD_WIDTH, FIELD_HEIGHT, {
 	magFilter: THREE.LinearFilter,
 	generateMipmaps: false,
 });
+const fieldTargets = Array.from({ length: 3 }, createFieldTarget);
+let [previousField, currentField, writingField] = fieldTargets;
+const fieldUniforms = THREE.UniformsUtils.clone(uniforms);
+let fieldStrip = 0;
+let fieldReady = false;
+let fieldBlendStart = 0;
+let fieldCycleStart = 0;
+let fieldBlendDuration = FIELD_STRIPS / 72;
 const fieldScene = new THREE.Scene();
 const fieldCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 fieldScene.add(new THREE.Mesh(
@@ -324,7 +363,7 @@ fieldScene.add(new THREE.Mesh(
 	new THREE.ShaderMaterial({
 		vertexShader: fieldVertex,
 		fragmentShader: fieldFragment,
-		uniforms,
+		uniforms: fieldUniforms,
 		depthWrite: false,
 		depthTest: false,
 	})
@@ -338,7 +377,10 @@ const dome = new THREE.Mesh(
 		vertexShader: domeVertex,
 		fragmentShader: domeFragment,
 		uniforms: {
-			uField: { value: fieldTarget.texture },
+			uField: { value: currentField.texture },
+			uPreviousField: { value: previousField.texture },
+			uFieldSize: { value: new THREE.Vector2(FIELD_WIDTH, FIELD_HEIGHT) },
+			uFieldBlend: { value: 1 },
 			uInverseProjection: { value: new THREE.Matrix4() },
 			uEyeWorld: { value: new THREE.Matrix4() },
 			uTime: uniforms.uTime,
@@ -435,7 +477,6 @@ window.addEventListener('resize', resize);
 
 let lastTime = null;
 let elapsed = 0;
-let nextField = 0;
 let contextLost = false;
 let recoveries = 0;
 
@@ -453,10 +494,14 @@ renderer.domElement.addEventListener('webglcontextlost', event => {
 renderer.domElement.addEventListener('webglcontextrestored', () => {
 	// Three restores its resources first; rebuild the field on the next frame.
 	recoveries++;
-	fieldTarget.setSize(Math.max(512, FIELD_WIDTH >> Math.min(recoveries, 2)),
-		Math.max(256, FIELD_HEIGHT >> Math.min(recoveries, 2)));
+	for (const target of fieldTargets) {
+		target.setSize(Math.max(512, FIELD_WIDTH >> Math.min(recoveries, 2)),
+			Math.max(256, FIELD_HEIGHT >> Math.min(recoveries, 2)));
+	}
+	dome.material.uniforms.uFieldSize.value.set(currentField.width, currentField.height);
+	fieldStrip = 0;
+	fieldReady = false;
 	contextLost = false;
-	nextField = 0;
 	lastTime = null;
 });
 document.addEventListener('visibilitychange', () => { lastTime = null; });
@@ -488,21 +533,50 @@ renderer.setAnimationLoop(time => {
 	uniforms.uTime.value = elapsed;
 	updatePalette(elapsed);
 
-	if (elapsed >= nextField) {
-		const xrWasEnabled = renderer.xr.enabled;
-		const eyeTarget = renderer.getRenderTarget();
-		const face = renderer.getActiveCubeFace();
-		const mip = renderer.getActiveMipmapLevel();
-		try {
-			renderer.xr.enabled = false;
-			renderer.setRenderTarget(fieldTarget);
-			renderer.render(fieldScene, fieldCamera);
-		} finally {
-			renderer.setRenderTarget(eyeTarget, face, mip);
-			renderer.xr.enabled = xrWasEnabled;
+	// Freeze all inputs for an entire panorama so strip boundaries cannot
+	// expose different gaze poses, animation times or palette colours.
+	if (fieldStrip === 0) {
+		fieldCycleStart = elapsed - dt;
+		fieldUniforms.uTime.value = uniforms.uTime.value;
+		for (let i = 0; i < TRAIL_LENGTH; i++) fieldUniforms.uTrail.value[i].copy(trail[i]);
+		for (const name of ['uColorDark', 'uColorMid', 'uColorLight']) {
+			fieldUniforms[name].value.copy(uniforms[name].value);
 		}
-		nextField = elapsed + 1 / FIELD_HZ;
 	}
+	const rowStart = Math.floor(fieldStrip * writingField.height / FIELD_STRIPS);
+	const rowEnd = Math.floor((fieldStrip + 1) * writingField.height / FIELD_STRIPS);
+	writingField.scissor.set(0, rowStart, writingField.width, rowEnd - rowStart);
+	writingField.scissorTest = true;
+	const xrWasEnabled = renderer.xr.enabled;
+	const eyeTarget = renderer.getRenderTarget();
+	const face = renderer.getActiveCubeFace();
+	const mip = renderer.getActiveMipmapLevel();
+	try {
+		renderer.xr.enabled = false;
+		renderer.setRenderTarget(writingField);
+		renderer.render(fieldScene, fieldCamera);
+	} finally {
+		renderer.setRenderTarget(eyeTarget, face, mip);
+		renderer.xr.enabled = xrWasEnabled;
+	}
+	if (++fieldStrip === FIELD_STRIPS) {
+		const spare = previousField;
+		previousField = currentField;
+		currentField = writingField;
+		writingField = spare;
+		const eyeUniforms = dome.material.uniforms;
+		eyeUniforms.uField.value = currentField.texture;
+		eyeUniforms.uPreviousField.value = fieldReady ? previousField.texture : currentField.texture;
+		fieldBlendStart = elapsed;
+		fieldBlendDuration = Math.max(elapsed - fieldCycleStart, 1 / 120);
+		fieldReady = true;
+		fieldStrip = 0;
+	}
+	// Keep the page's fallback until the first complete field is available.
+	if (!fieldReady) return;
+	dome.material.uniforms.uFieldBlend.value = THREE.MathUtils.clamp(
+		(elapsed - fieldBlendStart) / fieldBlendDuration, 0, 1);
+
 	renderer.render(scene, camera);
 	renderer.domElement.style.visibility = 'visible';
 	fallback.hidden = true;

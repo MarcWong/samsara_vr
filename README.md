@@ -42,17 +42,32 @@ npx serve .
 
 ## Quest rendering and recovery
 
-Mobile/Quest browsers use a 1024×512 field with four noise octaves per layer,
-updated at no more than 24 Hz. Desktop uses 2048×1024, five octaves and at most
-36 Hz. Eye rendering and head tracking continue at the headset frame rate.
-The mobile field draw shades 75% fewer pixels than the previous 2048×1024
-pass; this is a workload reduction, not a measured frame-rate claim.
-XR resolution scale is 0.85 on mobile, with moderate 0.35 fixed foveation.
+The visual reference is `ef18a44f558de35f2753b94fe94bdc46ae8d4cb4`:
+its five octaves per noise layer, cubic noise interpolation, angular gaze
+falloff, palette, drift and highlight shaping are retained. Frequencies too
+fine for the field texture fade toward their mean, rather than disappearing
+and darkening the clouds. Fine grain is reduced to 0.008 and added at eye
+resolution; the periodic sine texture from the first black-screen fix is gone.
 
-The sky reconstructs each eye's world direction from its own inverse
-projection using a fullscreen triangle, including asymmetric XR projections.
-There is no sphere tessellation. Quintic noise interpolation softens lattice
-transitions; faint, antialiased world-space texture is consistent between eyes.
+Quest/mobile uses a 1536×768 field, built in six horizontal strips. Desktop
+uses 2048×1024 in four strips. Only one strip is shaded each frame, including
+startup and recovery. Quest therefore shades 196,608 heavy pixels per draw,
+compared with 524,288 in the first black-screen fix. This bounds the peak draw;
+it does not imply lower total GPU cost or a measured frame-rate improvement.
+
+Three buffers separate the previous, current and in-progress snapshots. Time,
+trail and palette inputs are frozen throughout each build, so strips meet
+without temporal seams. Only complete panoramas are displayed. Both eyes use
+the same blend between completed snapshots on every frame. At 72 Hz the Quest
+field completes 12 snapshots/second; blending adds roughly one snapshot of
+latency to the slowly evolving field. Head pose itself is rendered every frame.
+
+The eye shader uses cubic B-spline reconstruction (four bilinear reads per
+snapshot) to soften magnified texel boundaries without overshoot. The sky
+reconstructs each eye's world direction from its own inverse projection,
+including asymmetric XR projections, without sphere tessellation. Eye scale
+is 1.0 and fixed foveation is disabled to avoid peripheral tiles. These quality
+improvements add eye-pass cost and require Quest performance validation.
 This remains a procedural sky, not a volumetric scene with motion parallax.
 
 On recoverable WebGL context loss, the page exits VR, shows a recovery message,
@@ -69,3 +84,13 @@ cannot be recovered by JavaScript; reload the page in that case.
 - Record headset frame times and any browser/GPU errors if blackouts persist.
 
 Desktop automation cannot establish Quest GPU performance or headset comfort.
+
+### Local validation of the quality revision
+
+- Chrome renders the desktop and Quest user-agent configurations without
+  JavaScript or shader errors; both simulated asymmetric eye projections draw.
+- A frozen field rendered in six strips matches a full draw byte-for-byte.
+- Simulated WebGL context loss restores both configurations at reduced size.
+- In a fixed forward view at time zero, the revised Quest field differs from
+  the reference by an average 0.87 per RGB channel on a 0–255 scale. This checks
+  broad visual fidelity, not headset aliasing, motion comfort or performance.
