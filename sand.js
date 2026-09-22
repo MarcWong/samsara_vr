@@ -78,12 +78,17 @@ const TRAIL_LENGTH = 8;
 const GAZE_EASE = 0.035;
 const TRAIL_DECAY = 0.78;
 
-// Equirect field texture. 1536x768 is ~1.2M heavy fragments a frame,
-// about a quarter of the direct-to-eye cost, and the field is soft enough
-// (finest octave ~12 texels at this size) that the eye pass upscaling it
-// 4-5x is invisible under the grain.
-const FIELD_WIDTH = 1536;
-const FIELD_HEIGHT = 768;
+// Equirect field texture. At 1536x768 the field read as blurry in the
+// headset: 90 degrees of view was only ~380 texels, so the two finest
+// octaves (which is where the sand grain lives) fell below one texel and
+// smeared. 2048x1024 keeps them, and the cost of the larger target is
+// paid for by refreshing it only every FIELD_EVERY frames -- the field
+// itself drifts slowly and the gaze trail is eased over dozens of frames,
+// so a 2-frame-old field under a per-frame head-tracked dome is not
+// something you can see. Amortised: ~1M heavy fragments a frame.
+const FIELD_WIDTH = 2048;
+const FIELD_HEIGHT = 1024;
+const FIELD_EVERY = 2;
 
 // --- FIELD pass: full-screen triangle into the equirect texture ---------
 
@@ -261,6 +266,12 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
 renderer.xr.enabled = true;
 renderer.xr.setReferenceSpaceType('local');
+// three defaults XR foveation to 1.0 (maximum fixed foveated rendering).
+// On a Quest that renders the periphery at 1/4..1/16 resolution in a
+// visible tile pattern, which on a field of fine grain reads as blocky
+// low-res patches. The eye pass is one texture lookup now, so full
+// resolution everywhere is affordable.
+renderer.xr.setFoveation(0);
 document.body.appendChild(renderer.domElement);
 document.body.appendChild(VRButton.createButton(renderer));
 document.getElementById('fallback').remove();
@@ -329,7 +340,7 @@ fieldScene.add(new THREE.Mesh(
 ));
 
 const dome = new THREE.Mesh(
-	new THREE.SphereGeometry(20, 48, 32),
+	new THREE.SphereGeometry(20, 96, 64),
 	new THREE.ShaderMaterial({
 		vertexShader: domeVertex,
 		fragmentShader: domeFragment,
@@ -422,6 +433,7 @@ function resize() {
 window.addEventListener('resize', resize);
 
 const timer = new THREE.Timer();
+let frame = 0;
 
 renderer.setAnimationLoop(() => {
 	let head = camera;
@@ -450,13 +462,15 @@ renderer.setAnimationLoop(() => {
 	// (two viewports) for whatever camera it is handed, which would split
 	// the equirect texture in half -- so XR is switched off around this
 	// one draw and the XR render target restored afterwards.
-	const xrWasEnabled = renderer.xr.enabled;
-	const eyeTarget = renderer.getRenderTarget();
-	renderer.xr.enabled = false;
-	renderer.setRenderTarget(fieldTarget);
-	renderer.render(fieldScene, fieldCamera);
-	renderer.setRenderTarget(eyeTarget);
-	renderer.xr.enabled = xrWasEnabled;
+	if (frame++ % FIELD_EVERY === 0) {
+		const xrWasEnabled = renderer.xr.enabled;
+		const eyeTarget = renderer.getRenderTarget();
+		renderer.xr.enabled = false;
+		renderer.setRenderTarget(fieldTarget);
+		renderer.render(fieldScene, fieldCamera);
+		renderer.setRenderTarget(eyeTarget);
+		renderer.xr.enabled = xrWasEnabled;
+	}
 
 	renderer.render(scene, camera);
 });
