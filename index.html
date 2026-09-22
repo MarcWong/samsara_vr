@@ -7,11 +7,12 @@
 	<style>
 		html, body { margin: 0; height: 100%; overflow: hidden; background: #0d1620; }
 		canvas { display: block; }
+		#status { position: fixed; inset: 40% 10% auto; z-index: 2; color: #dce8ee; text-align: center; font: 16px system-ui; }
 		/* Shown only while the WebGL context has not come up yet (or when it
 		   fails), so the first frame is never a flash of white. Same fallback
 		   gradient the original screen used. */
 		#fallback {
-			position: fixed; inset: 0; z-index: -1;
+			position: fixed; inset: 0; z-index: 0; pointer-events: none;
 			background: radial-gradient(circle at 50% 0%, #24404d, #0d1620 70%);
 		}
 		/* One-tap gate for phones that require a gesture before handing out
@@ -35,6 +36,7 @@
 </head>
 <body>
 	<div id="fallback"></div>
+	<p id="status" role="status" hidden></p>
 	<button id="orient" type="button">Enable head tracking</button>
 	<script type="module" src="./sand.js"></script>
 </body>

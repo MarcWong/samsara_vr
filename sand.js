@@ -2,7 +2,7 @@
 // (Background.svelte) onto a WebXR sky dome.
 //
 // What changed in the move from a 2D full-screen quad to VR:
-//   - The shader is drawn on the inside of a sphere that follows the head,
+//   - The shader reconstructs a sky direction for every eye pixel,
 //     so the sand surrounds the viewer instead of sitting behind a page.
 //   - The noise field is sampled in 3D on the view direction (the 2D version
 //     would need an equirectangular seam somewhere on the dome).
@@ -10,20 +10,12 @@
 //     where the head is looking: a gaze direction, eased the same way the
 //     cursor used to be. Distance from the pull point is angular (radians),
 //     which keeps the original 0.6 falloff radius meaningful (~34 degrees).
-// Everything else -- drift speed, octave layout, grain, palette and the
-// three-stop colour mix -- is the same as the original.
+// Palette drift and the gaze wake retain the original visual direction.
 //
-// Rendering is split in two passes, and that split is what keeps a Quest
-// alive. Evaluating ten octaves of 3D noise per eye pixel (x8 trail
-// points) came to ~4.5M heavy fragments a frame at native resolution;
-// the Quest browser first dropped its render scale to stay at 72Hz (the
-// dome went blurry) and then the GPU watchdog killed the tab. So:
-//   1. FIELD pass: the noise/colour is computed once per frame into a
-//      small equirectangular texture (FIELD_WIDTH x FIELD_HEIGHT) that
-//      covers the whole sphere of directions.
-//   2. DOME pass: what the headset actually rasterises is one texture
-//      lookup per pixel plus the film grain, which is added here so it
-//      stays at native pixel size and does not upscale into blotches.
+// A bounded offscreen field provides the broad flow. The eye pass reconstructs
+// world rays from each eye's projection, without a tessellated sky sphere.
+// Mobile targets must be small per draw: skipping frames does not reduce a
+// GPU watchdog's worst-case draw time.
 
 import * as THREE from 'three';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
@@ -78,17 +70,11 @@ const TRAIL_LENGTH = 8;
 const GAZE_EASE = 0.035;
 const TRAIL_DECAY = 0.78;
 
-// Equirect field texture. At 1536x768 the field read as blurry in the
-// headset: 90 degrees of view was only ~380 texels, so the two finest
-// octaves (which is where the sand grain lives) fell below one texel and
-// smeared. 2048x1024 keeps them, and the cost of the larger target is
-// paid for by refreshing it only every FIELD_EVERY frames -- the field
-// itself drifts slowly and the gaze trail is eased over dozens of frames,
-// so a 2-frame-old field under a per-frame head-tracked dome is not
-// something you can see. Amortised: ~1M heavy fragments a frame.
-const FIELD_WIDTH = 2048;
-const FIELD_HEIGHT = 1024;
-const FIELD_EVERY = 2;
+const MOBILE = /Quest|Oculus|Android|Mobile/i.test(navigator.userAgent);
+const FIELD_WIDTH = MOBILE ? 1024 : 2048;
+const FIELD_HEIGHT = FIELD_WIDTH / 2;
+const FIELD_HZ = MOBILE ? 24 : 36;
+const FIELD_OCTAVES = MOBILE ? 4 : 5;
 
 // --- FIELD pass: full-screen triangle into the equirect texture ---------
 
@@ -123,7 +109,7 @@ const fieldFragment = /* glsl */ `
 	float noise(vec3 p) {
 		vec3 i = floor(p);
 		vec3 f = fract(p);
-		vec3 u = f * f * (3.0 - 2.0 * f);
+		vec3 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
 		float n000 = hash3(i);
 		float n100 = hash3(i + vec3(1.0, 0.0, 0.0));
 		float n010 = hash3(i + vec3(0.0, 1.0, 0.0));
@@ -142,7 +128,7 @@ const fieldFragment = /* glsl */ `
 	float fbm(vec3 p) {
 		float value = 0.0;
 		float amplitude = 0.5;
-		for (int i = 0; i < 5; i++) {
+		for (int i = 0; i < ${FIELD_OCTAVES}; i++) {
 			value += amplitude * noise(p);
 			p *= 2.0;
 			amplitude *= 0.5;
@@ -165,9 +151,9 @@ const fieldFragment = /* glsl */ `
 		float pull = 0.0;
 		vec3 drag = vec3(0.0);
 		for (int i = 0; i < TRAIL_LENGTH; i++) {
-			vec3 g = normalize(uTrail[i]);
-			float d = acos(clamp(dot(dir, g), -1.0, 1.0));
-			float p = smoothstep(0.6, 0.0, d) * uTrailWeight[i];
+			vec3 g = uTrail[i];
+			// Ordered edges are required by GLSL; cosine avoids eight acos calls.
+			float p = smoothstep(0.8253356, 1.0, dot(dir, g)) * uTrailWeight[i];
 			pull += p;
 			drag += (dir - g) * p;
 		}
@@ -217,12 +203,13 @@ const fieldFragment = /* glsl */ `
 // --- DOME pass: what the eyes see -----------------------------------------
 
 const domeVertex = /* glsl */ `
-	varying vec3 vDir;
+	uniform mat4 uInverseProjection;
+	uniform mat4 uEyeWorld;
+	varying highp vec3 vDir;
 	void main() {
-		// Sphere is centred on the head and never rotated, so the object-space
-		// vertex direction is the world-space view direction of that texel.
-		vDir = position;
-		gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+		vec4 ray = uInverseProjection * vec4(position.xy, 1.0, 1.0);
+		vDir = mat3(uEyeWorld) * (ray.xyz / ray.w);
+		gl_Position = vec4(position.xy, 1.0, 1.0);
 	}
 `;
 
@@ -232,7 +219,7 @@ const domeFragment = /* glsl */ `
 	uniform sampler2D uField;
 	uniform float uTime;
 
-	varying vec3 vDir;
+	varying highp vec3 vDir;
 
 	float hash(vec2 p) {
 		p = fract(p * vec2(123.34, 456.21));
@@ -250,31 +237,35 @@ const domeFragment = /* glsl */ `
 		);
 		vec3 color = texture2D(uField, uv).rgb;
 
-		// Half the original grain; on a pale field the full 0.04 reads as
-		// dust rather than the texture it gave the dark version.
-		color += (hash(gl_FragCoord.xy + uTime) - 0.5) * 0.02;
+		// Stable world-space microtexture: both eyes see the same detail,
+		// rather than unrelated, sparkling screen-space noise.
+		vec3 p = dir * 700.0;
+		float footprint = max(length(dFdx(p)), length(dFdy(p)));
+		float detail = sin(p.x + sin(p.z)) * sin(p.y - p.z);
+		color += detail * 0.009 * (1.0 - smoothstep(0.5, 2.0, footprint));
+		// Subtle quantization dither, below a single 8-bit step.
+		color += (hash(gl_FragCoord.xy) - 0.5) / 255.0;
 
 		gl_FragColor = vec4(color, 1.0);
 	}
 `;
 
 const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, MOBILE ? 1 : 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 // Palette values are sRGB hex and the original wrote them straight to the
 // canvas; leave them alone rather than letting three re-encode them.
 renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
 renderer.xr.enabled = true;
 renderer.xr.setReferenceSpaceType('local');
-// three defaults XR foveation to 1.0 (maximum fixed foveated rendering).
-// On a Quest that renders the periphery at 1/4..1/16 resolution in a
-// visible tile pattern, which on a field of fine grain reads as blocky
-// low-res patches. The eye pass is one texture lookup now, so full
-// resolution everywhere is affordable.
-renderer.xr.setFoveation(0);
+// Configure before entering XR. Keep modest peripheral savings without
+// the conspicuous blocks of maximum fixed foveation.
+renderer.xr.setFramebufferScaleFactor(MOBILE ? 0.85 : 1);
+renderer.xr.setFoveation(MOBILE ? 0.35 : 0);
 document.body.appendChild(renderer.domElement);
 document.body.appendChild(VRButton.createButton(renderer));
-document.getElementById('fallback').remove();
+const fallback = document.getElementById('fallback');
+const status = document.getElementById('status');
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 100);
@@ -340,19 +331,30 @@ fieldScene.add(new THREE.Mesh(
 ));
 
 const dome = new THREE.Mesh(
-	new THREE.SphereGeometry(20, 96, 64),
+	new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute([
+		-1, -1, 0, 3, -1, 0, -1, 3, 0,
+	], 3)),
 	new THREE.ShaderMaterial({
 		vertexShader: domeVertex,
 		fragmentShader: domeFragment,
 		uniforms: {
 			uField: { value: fieldTarget.texture },
+			uInverseProjection: { value: new THREE.Matrix4() },
+			uEyeWorld: { value: new THREE.Matrix4() },
 			uTime: uniforms.uTime,
 		},
-		side: THREE.BackSide,
+		side: THREE.FrontSide,
 		depthWrite: false,
 		depthTest: false,
 	})
 );
+dome.frustumCulled = false;
+// Three calls this separately for each XR eye, including asymmetric frusta.
+dome.onBeforeRender = (_renderer, _scene, eye) => {
+	dome.material.uniforms.uInverseProjection.value.copy(eye.projectionMatrixInverse);
+	dome.material.uniforms.uEyeWorld.value.copy(eye.matrixWorld);
+	dome.material.uniformsNeedUpdate = true;
+};
 scene.add(dome);
 
 // ---------------------------------------------------------------------------
@@ -367,7 +369,6 @@ scene.add(dome);
 
 const gazeTarget = new THREE.Vector3(0, 0, -1);
 const trail = uniforms.uTrail.value;
-const headPos = new THREE.Vector3();
 
 const orient = {
 	active: false,
@@ -432,45 +433,78 @@ function resize() {
 }
 window.addEventListener('resize', resize);
 
-const timer = new THREE.Timer();
-let frame = 0;
+let lastTime = null;
+let elapsed = 0;
+let nextField = 0;
+let contextLost = false;
+let recoveries = 0;
 
-renderer.setAnimationLoop(() => {
+renderer.domElement.addEventListener('webglcontextlost', event => {
+	event.preventDefault();
+	contextLost = true;
+	fallback.hidden = false;
+	renderer.domElement.style.visibility = 'hidden';
+	status.textContent = 'Graphics interrupted. Recovering…';
+	status.hidden = false;
+	// DOM recovery is only visible outside immersive mode.
+	const session = renderer.xr.getSession();
+	if (session) session.end().catch(console.warn);
+});
+renderer.domElement.addEventListener('webglcontextrestored', () => {
+	// Three restores its resources first; rebuild the field on the next frame.
+	recoveries++;
+	fieldTarget.setSize(Math.max(512, FIELD_WIDTH >> Math.min(recoveries, 2)),
+		Math.max(256, FIELD_HEIGHT >> Math.min(recoveries, 2)));
+	contextLost = false;
+	nextField = 0;
+	lastTime = null;
+});
+document.addEventListener('visibilitychange', () => { lastTime = null; });
+renderer.xr.addEventListener('sessionend', () => { resize(); lastTime = null; });
+
+renderer.setAnimationLoop(time => {
+	if (contextLost) return;
+	// In immersive mode use XR visibility; the 2D document may be hidden.
+	if (renderer.xr.isPresenting) {
+		if (renderer.xr.getSession().visibilityState === 'hidden') return;
+	} else if (document.hidden) return;
+	const dt = lastTime === null ? 1 / 72 : Math.min(Math.max((time - lastTime) / 1000, 0), 0.05);
+	lastTime = time;
+	elapsed += dt;
 	let head = camera;
 	if (renderer.xr.isPresenting) {
+		renderer.xr.updateCamera(camera);
 		head = renderer.xr.getCamera();
 	} else if (orient.active) {
 		applyDeviceOrientation(camera.quaternion);
 	}
-
 	head.getWorldDirection(gazeTarget);
-	head.getWorldPosition(headPos);
-	dome.position.copy(headPos);
-
-	// each link chases the one ahead of it; the head leads the chain
 	let ahead = gazeTarget;
+	const ease = 1 - Math.pow(1 - GAZE_EASE, dt * 72);
 	for (let i = 0; i < TRAIL_LENGTH; i++) {
-		trail[i].lerp(ahead, GAZE_EASE).normalize();
+		trail[i].lerp(ahead, ease).normalize();
 		ahead = trail[i];
 	}
+	uniforms.uTime.value = elapsed;
+	updatePalette(elapsed);
 
-	timer.update();
-	uniforms.uTime.value = timer.getElapsed();
-	updatePalette(uniforms.uTime.value);
-
-	// Field pass. While presenting, render() swaps in the XR array camera
-	// (two viewports) for whatever camera it is handed, which would split
-	// the equirect texture in half -- so XR is switched off around this
-	// one draw and the XR render target restored afterwards.
-	if (frame++ % FIELD_EVERY === 0) {
+	if (elapsed >= nextField) {
 		const xrWasEnabled = renderer.xr.enabled;
 		const eyeTarget = renderer.getRenderTarget();
-		renderer.xr.enabled = false;
-		renderer.setRenderTarget(fieldTarget);
-		renderer.render(fieldScene, fieldCamera);
-		renderer.setRenderTarget(eyeTarget);
-		renderer.xr.enabled = xrWasEnabled;
+		const face = renderer.getActiveCubeFace();
+		const mip = renderer.getActiveMipmapLevel();
+		try {
+			renderer.xr.enabled = false;
+			renderer.setRenderTarget(fieldTarget);
+			renderer.render(fieldScene, fieldCamera);
+		} finally {
+			renderer.setRenderTarget(eyeTarget, face, mip);
+			renderer.xr.enabled = xrWasEnabled;
+		}
+		nextField = elapsed + 1 / FIELD_HZ;
 	}
-
 	renderer.render(scene, camera);
+	renderer.domElement.style.visibility = 'visible';
+	fallback.hidden = true;
+	status.hidden = true;
 });

@@ -39,3 +39,33 @@ npx serve .
 
 - `index.html` — page shell + import map (three.js 0.185.1 from jsDelivr)
 - `sand.js` — shader, dome, head tracking
+
+## Quest rendering and recovery
+
+Mobile/Quest browsers use a 1024×512 field with four noise octaves per layer,
+updated at no more than 24 Hz. Desktop uses 2048×1024, five octaves and at most
+36 Hz. Eye rendering and head tracking continue at the headset frame rate.
+The mobile field draw shades 75% fewer pixels than the previous 2048×1024
+pass; this is a workload reduction, not a measured frame-rate claim.
+XR resolution scale is 0.85 on mobile, with moderate 0.35 fixed foveation.
+
+The sky reconstructs each eye's world direction from its own inverse
+projection using a fullscreen triangle, including asymmetric XR projections.
+There is no sphere tessellation. Quintic noise interpolation softens lattice
+transitions; faint, antialiased world-space texture is consistent between eyes.
+This remains a procedural sky, not a volumetric scene with motion parallax.
+
+On recoverable WebGL context loss, the page exits VR, shows a recovery message,
+and rebuilds the field at reduced resolution after the browser restores the
+context. Enter VR again after recovery. A browser process killed by the OS
+cannot be recovered by JavaScript; reload the page in that case.
+
+### Headset acceptance checks
+
+- Open the page in Quest Browser and leave it running for at least five minutes.
+- Enter VR, look around and up/down, and check the panorama seam and both eyes.
+- Turn quickly: the view must track every frame while the flow wake eases behind.
+- Exit/re-enter VR and suspend/resume the browser. Check that rendering continues.
+- Record headset frame times and any browser/GPU errors if blackouts persist.
+
+Desktop automation cannot establish Quest GPU performance or headset comfort.
