@@ -71,17 +71,18 @@ const GAZE_EASE = 0.035;
 const TRAIL_DECAY = 0.78;
 
 const MOBILE = /Quest|Oculus|Android|Mobile/i.test(navigator.userAgent);
-const FIELD_WIDTH = MOBILE ? 1536 : 2048;
+const FIELD_WIDTH = MOBILE ? 1024 : 2048;
 const FIELD_HEIGHT = FIELD_WIDTH / 2;
-// Only one strip is shaded per frame, even during startup and recovery.
-// Quest: 1536 * 128 = 196608 heavy pixels, versus 524288 in the black-screen fix.
-const FIELD_STRIPS = MOBILE ? 6 : 4;
+// Bound both the size of a draw AND the number of draws per second.
+// Mobile: at most 48 * 1024 * 128 = 6.29M heavy pixels/second.
+const FIELD_STRIPS = 4;
+const FIELD_MAX_STRIPS_PER_SECOND = MOBILE ? 48 : 72;
 const FIELD_OCTAVES = 5;
 
 // --- FIELD pass: full-screen triangle into the equirect texture ---------
 
 const fieldVertex = /* glsl */ `
-	varying vec2 vUv;
+	varying highp vec2 vUv;
 	void main() {
 		vUv = uv;
 		gl_Position = vec4(position.xy, 0.0, 1.0);
@@ -100,7 +101,7 @@ const fieldFragment = /* glsl */ `
 	uniform vec3 uColorMid;
 	uniform vec3 uColorLight;
 
-	varying vec2 vUv;
+	varying highp vec2 vUv;
 
 	float hash3(vec3 p) {
 		p = fract(p * vec3(123.34, 456.21, 789.12));
@@ -160,7 +161,7 @@ const fieldFragment = /* glsl */ `
 		vec3 drag = vec3(0.0);
 		for (int i = 0; i < TRAIL_LENGTH; i++) {
 			vec3 g = uTrail[i];
-			// Restore ef18a44's angular falloff, with defined smoothstep edges.
+			// Reference falloff, with defined smoothstep edges.
 			float d = acos(clamp(dot(dir, g), -1.0, 1.0));
 			float p = (1.0 - smoothstep(0.0, 0.6, d)) * uTrailWeight[i];
 			pull += p;
@@ -205,6 +206,12 @@ const fieldFragment = /* glsl */ `
 		// sky showing through rather than grey.
 		color = mix(color, color * vec3(0.97, 0.99, 1.03), 1.0 - smoothstep(0.35, 0.75, n));
 
+		#if FIELD_DITHER
+		// Quantization must be dithered BEFORE storage; adding grain after
+		// sampling an already banded texture cannot recover its gradients.
+		float dither = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+		color += (dither - 0.5) / 255.0;
+		#endif
 		gl_FragColor = vec4(color, 1.0);
 	}
 `;
@@ -218,12 +225,15 @@ const domeVertex = /* glsl */ `
 	void main() {
 		vec4 ray = uInverseProjection * vec4(position.xy, 1.0, 1.0);
 		vDir = mat3(uEyeWorld) * (ray.xyz / ray.w);
-		gl_Position = vec4(position.xy, 1.0, 1.0);
+		// Depth is disabled; stay strictly inside the clip volume instead
+		// of placing the sky exactly on a headset's far clipping plane.
+		gl_Position = vec4(position.xy, 0.0, 1.0);
 	}
 `;
 
 const domeFragment = /* glsl */ `
 	precision highp float;
+	#define MOBILE_EYES ${MOBILE ? 1 : 0}
 
 	uniform sampler2D uField;
 	uniform sampler2D uPreviousField;
@@ -243,6 +253,11 @@ const domeFragment = /* glsl */ `
 	// a 16-texel kernel (GPU Gems 2, chapter 20). RepeatWrapping preserves
 	// continuity at the longitude seam. Positive weights avoid ringing.
 	vec3 sampleField(sampler2D tex, vec2 uv) {
+		#if MOBILE_EYES
+		// One hardware-filtered read per snapshot, rather than four.
+		// Field noise is already bandwidth-limited before it is stored.
+		return texture2D(tex, uv).rgb;
+		#else
 		vec2 p = uv * uFieldSize - 0.5;
 		vec2 base = floor(p);
 		vec2 f = fract(p);
@@ -260,6 +275,7 @@ const domeFragment = /* glsl */ `
 			mix(texture2D(tex, a).rgb, texture2D(tex, vec2(b.x, a.y)).rgb, g1.x),
 			mix(texture2D(tex, vec2(a.x, b.y)).rgb, texture2D(tex, b).rgb, g1.x),
 			g1.y);
+		#endif
 	}
 
 	void main() {
@@ -282,16 +298,20 @@ const domeFragment = /* glsl */ `
 `;
 
 const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, MOBILE ? 1 : 2));
+function previewPixelRatio() {
+	const cap = MOBILE ? Math.sqrt(1280 * 960 / Math.max(1, window.innerWidth * window.innerHeight)) : 2;
+	return Math.min(window.devicePixelRatio || 1, MOBILE ? 1 : 2, cap);
+}
+renderer.setPixelRatio(previewPixelRatio());
 renderer.setSize(window.innerWidth, window.innerHeight);
 // Palette values are sRGB hex and the original wrote them straight to the
 // canvas; leave them alone rather than letting three re-encode them.
 renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
 renderer.xr.enabled = true;
 renderer.xr.setReferenceSpaceType('local');
-// The expensive field is budgeted separately. Preserve eye resolution
-// and avoid foveation tile boundaries across this smooth, continuous sky.
-renderer.xr.setFramebufferScaleFactor(1);
+// Return to the eye resolution used by the confirmed stable revision.
+// Keep foveation off: peripheral rate boundaries are visible on this sky.
+renderer.xr.setFramebufferScaleFactor(MOBILE ? 0.85 : 1);
 renderer.xr.setFoveation(0);
 document.body.appendChild(renderer.domElement);
 document.body.appendChild(VRButton.createButton(renderer));
@@ -339,7 +359,12 @@ function updatePalette(seconds) {
 }
 updatePalette(0);
 
+// Preserve smooth cloud gradients before the eye shader interpolates them.
+// Three half-float mobile fields consume 12 MiB, below the previous three
+// 1536x768 byte fields (13.5 MiB).
+const fieldHighPrecision = renderer.extensions.has('EXT_color_buffer_float');
 const createFieldTarget = () => new THREE.WebGLRenderTarget(FIELD_WIDTH, FIELD_HEIGHT, {
+	type: fieldHighPrecision ? THREE.HalfFloatType : THREE.UnsignedByteType,
 	depthBuffer: false,
 	stencilBuffer: false,
 	wrapS: THREE.RepeatWrapping,
@@ -363,6 +388,7 @@ fieldScene.add(new THREE.Mesh(
 	new THREE.ShaderMaterial({
 		vertexShader: fieldVertex,
 		fragmentShader: fieldFragment,
+		defines: { FIELD_DITHER: fieldHighPrecision ? 0 : 1 },
 		uniforms: fieldUniforms,
 		depthWrite: false,
 		depthTest: false,
@@ -469,6 +495,7 @@ renderer.xr.addEventListener('sessionstart', () => { orientButton.style.display 
 
 function resize() {
 	if (renderer.xr.isPresenting) return;
+	renderer.setPixelRatio(previewPixelRatio());
 	renderer.setSize(window.innerWidth, window.innerHeight);
 	camera.aspect = window.innerWidth / window.innerHeight;
 	camera.updateProjectionMatrix();
@@ -479,10 +506,65 @@ let lastTime = null;
 let elapsed = 0;
 let contextLost = false;
 let recoveries = 0;
+let nextFieldTime = 0;
+let nextPreviewTime = 0;
+let reducedWork = false;
+let slowSeconds = 0;
+let renderedFrames = 0;
+let fieldDraws = 0;
+let lastCheckpoint = 0;
+const startedAt = performance.now();
+const diagnosticKey = 'flowing-sand:diagnostics';
+const recentEvents = [];
+const diagnostics = {
+	version: 'quest-budget-v3', mobile: MOBILE, contextLost: false,
+	fieldFormat: fieldHighPrecision ? 'rgba16f' : 'rgba8-dithered',
+	shaderPrecision: renderer.capabilities.precision,
+	lastFrameMs: 0, frames: 0, fieldDraws: 0, reducedWork: false,
+	xr: false, visibility: 'visible', error: null,
+};
+// No per-frame storage writes. Keep the last checkpoint across a tab reload
+// so an on-device failure can be distinguished from a clean context loss.
+function checkpoint(event) {
+	if (event) {
+		recentEvents.push({ event, seconds: Math.round((performance.now() - startedAt) / 100) / 10 });
+		if (recentEvents.length > 12) recentEvents.shift();
+	}
+	try { localStorage.setItem(diagnosticKey, JSON.stringify({ ...diagnostics, events: recentEvents })); } catch {}
+}
+let previousRun = null;
+try { previousRun = JSON.parse(localStorage.getItem(diagnosticKey)); } catch {}
+window.flowDiagnostics = { current: diagnostics, previousRun, events: recentEvents };
+const debug = new URLSearchParams(location.search).has('diagnostics');
+if (debug) {
+	const panel = document.createElement('pre');
+	panel.style.cssText = 'position:fixed;top:0;left:0;z-index:10;max-width:95vw;white-space:pre-wrap;background:#000b;color:white;padding:8px;font:12px monospace;pointer-events:none';
+	document.body.appendChild(panel);
+	setInterval(() => { panel.textContent = JSON.stringify(window.flowDiagnostics, null, 2); }, 1000);
+}
+window.addEventListener('error', event => {
+	diagnostics.error = event.message;
+	checkpoint('script-error');
+});
+window.addEventListener('unhandledrejection', event => {
+	diagnostics.error = String(event.reason);
+	checkpoint('unhandled-rejection');
+});
+renderer.debug.onShaderError = (gl, program, vertexShader, fragmentShader) => {
+	throw new Error('Shader compilation failed: ' + [gl.getProgramInfoLog(program),
+		gl.getShaderInfoLog(vertexShader), gl.getShaderInfoLog(fragmentShader)].filter(Boolean).join(' | '));
+};
+window.addEventListener('pagehide', () => checkpoint('page-hidden'));
+checkpoint('startup');
 
 renderer.domElement.addEventListener('webglcontextlost', event => {
 	event.preventDefault();
 	contextLost = true;
+	diagnostics.contextLost = true;
+	// Release Three's listeners/cache while the context is still lost.
+	// Resizing after restoration otherwise disposes invalid old GL handles.
+	for (const target of fieldTargets) target.dispose();
+	checkpoint('context-lost');
 	fallback.hidden = false;
 	renderer.domElement.style.visibility = 'hidden';
 	status.textContent = 'Graphics interrupted. Recovering…';
@@ -502,18 +584,37 @@ renderer.domElement.addEventListener('webglcontextrestored', () => {
 	fieldStrip = 0;
 	fieldReady = false;
 	contextLost = false;
+	diagnostics.contextLost = false;
+	reducedWork = true;
+	nextFieldTime = 0;
+	checkpoint('context-restored');
 	lastTime = null;
 });
 document.addEventListener('visibilitychange', () => { lastTime = null; });
-renderer.xr.addEventListener('sessionend', () => { resize(); lastTime = null; });
+renderer.xr.addEventListener('sessionend', () => { resize(); lastTime = null; checkpoint('xr-end'); });
+renderer.xr.addEventListener('sessionstart', () => { lastTime = null; checkpoint('xr-start'); });
 
-renderer.setAnimationLoop(time => {
+function renderFrame(time) {
 	if (contextLost) return;
 	// In immersive mode use XR visibility; the 2D document may be hidden.
 	if (renderer.xr.isPresenting) {
 		if (renderer.xr.getSession().visibilityState === 'hidden') return;
 	} else if (document.hidden) return;
-	const dt = lastTime === null ? 1 / 72 : Math.min(Math.max((time - lastTime) / 1000, 0), 0.05);
+	// The headset browser's ordinary page is a preview, not an XR eye.
+	if (MOBILE && !renderer.xr.isPresenting) {
+		if (time < nextPreviewTime) return;
+		nextPreviewTime = time + 1000 / 30 - 0.1;
+	}
+	const frameSeconds = lastTime === null ? 1 / 72 : Math.max((time - lastTime) / 1000, 0);
+	const dt = Math.min(frameSeconds, 0.05);
+	// Only sustained misses count, not one shader compile or resume event.
+	if (MOBILE && time - startedAt > 2000 && !reducedWork) {
+		slowSeconds = Math.max(0, slowSeconds + (frameSeconds > (renderer.xr.isPresenting ? 0.026 : 0.055) ? Math.min(frameSeconds, 0.1) : -frameSeconds * 0.5));
+		if (slowSeconds > 0.7) {
+			reducedWork = true;
+			checkpoint('sustained-frame-misses');
+		}
+	}
 	lastTime = time;
 	elapsed += dt;
 	let head = camera;
@@ -533,44 +634,49 @@ renderer.setAnimationLoop(time => {
 	uniforms.uTime.value = elapsed;
 	updatePalette(elapsed);
 
-	// Freeze all inputs for an entire panorama so strip boundaries cannot
-	// expose different gaze poses, animation times or palette colours.
-	if (fieldStrip === 0) {
-		fieldCycleStart = elapsed - dt;
-		fieldUniforms.uTime.value = uniforms.uTime.value;
-		for (let i = 0; i < TRAIL_LENGTH; i++) fieldUniforms.uTrail.value[i].copy(trail[i]);
-		for (const name of ['uColorDark', 'uColorMid', 'uColorLight']) {
-			fieldUniforms[name].value.copy(uniforms[name].value);
+	if (time >= nextFieldTime) {
+		// Never catch up missed work with multiple expensive draws.
+		nextFieldTime = time + 1000 / (reducedWork ? 24 : FIELD_MAX_STRIPS_PER_SECOND);
+		fieldDraws++;
+		// Freeze all inputs for an entire panorama so strip boundaries cannot
+		// expose different gaze poses, animation times or palette colours.
+		if (fieldStrip === 0) {
+			fieldCycleStart = elapsed - dt;
+			fieldUniforms.uTime.value = uniforms.uTime.value;
+			for (let i = 0; i < TRAIL_LENGTH; i++) fieldUniforms.uTrail.value[i].copy(trail[i]);
+			for (const name of ['uColorDark', 'uColorMid', 'uColorLight']) {
+				fieldUniforms[name].value.copy(uniforms[name].value);
+			}
 		}
-	}
-	const rowStart = Math.floor(fieldStrip * writingField.height / FIELD_STRIPS);
-	const rowEnd = Math.floor((fieldStrip + 1) * writingField.height / FIELD_STRIPS);
-	writingField.scissor.set(0, rowStart, writingField.width, rowEnd - rowStart);
-	writingField.scissorTest = true;
-	const xrWasEnabled = renderer.xr.enabled;
-	const eyeTarget = renderer.getRenderTarget();
-	const face = renderer.getActiveCubeFace();
-	const mip = renderer.getActiveMipmapLevel();
-	try {
-		renderer.xr.enabled = false;
-		renderer.setRenderTarget(writingField);
-		renderer.render(fieldScene, fieldCamera);
-	} finally {
-		renderer.setRenderTarget(eyeTarget, face, mip);
-		renderer.xr.enabled = xrWasEnabled;
-	}
-	if (++fieldStrip === FIELD_STRIPS) {
-		const spare = previousField;
-		previousField = currentField;
-		currentField = writingField;
-		writingField = spare;
-		const eyeUniforms = dome.material.uniforms;
-		eyeUniforms.uField.value = currentField.texture;
-		eyeUniforms.uPreviousField.value = fieldReady ? previousField.texture : currentField.texture;
-		fieldBlendStart = elapsed;
-		fieldBlendDuration = Math.max(elapsed - fieldCycleStart, 1 / 120);
-		fieldReady = true;
-		fieldStrip = 0;
+		const rowStart = Math.floor(fieldStrip * writingField.height / FIELD_STRIPS);
+		const rowEnd = Math.floor((fieldStrip + 1) * writingField.height / FIELD_STRIPS);
+		writingField.scissor.set(0, rowStart, writingField.width, rowEnd - rowStart);
+		writingField.scissorTest = true;
+		const xrWasEnabled = renderer.xr.enabled;
+		const eyeTarget = renderer.getRenderTarget();
+		const face = renderer.getActiveCubeFace();
+		const mip = renderer.getActiveMipmapLevel();
+		try {
+			renderer.xr.enabled = false;
+			renderer.setRenderTarget(writingField);
+			renderer.render(fieldScene, fieldCamera);
+		} finally {
+			renderer.setRenderTarget(eyeTarget, face, mip);
+			renderer.xr.enabled = xrWasEnabled;
+		}
+		if (++fieldStrip === FIELD_STRIPS) {
+			const spare = previousField;
+			previousField = currentField;
+			currentField = writingField;
+			writingField = spare;
+			const eyeUniforms = dome.material.uniforms;
+			eyeUniforms.uField.value = currentField.texture;
+			eyeUniforms.uPreviousField.value = fieldReady ? previousField.texture : currentField.texture;
+			fieldBlendStart = elapsed;
+			fieldBlendDuration = Math.max(elapsed - fieldCycleStart, 1 / 120);
+			fieldReady = true;
+			fieldStrip = 0;
+		}
 	}
 	// Keep the page's fallback until the first complete field is available.
 	if (!fieldReady) return;
@@ -581,4 +687,26 @@ renderer.setAnimationLoop(time => {
 	renderer.domElement.style.visibility = 'visible';
 	fallback.hidden = true;
 	status.hidden = true;
+	diagnostics.lastFrameMs = Math.round(frameSeconds * 1000);
+	diagnostics.frames = ++renderedFrames;
+	diagnostics.fieldDraws = fieldDraws;
+	diagnostics.reducedWork = reducedWork;
+	diagnostics.xr = renderer.xr.isPresenting;
+	diagnostics.visibility = renderer.xr.getSession()?.visibilityState ?? document.visibilityState;
+	if (time - lastCheckpoint >= 3000) { lastCheckpoint = time; checkpoint(); }
+}
+renderer.setAnimationLoop(time => {
+	try { renderFrame(time); } catch (error) {
+		// Stop resubmitting a failing draw and show a readable fallback.
+		renderer.setAnimationLoop(null);
+		renderer.domElement.style.visibility = 'hidden';
+		fallback.hidden = false;
+		status.hidden = false;
+		status.textContent = 'Rendering interrupted. Reload the page to restart.';
+		diagnostics.error = String(error);
+		checkpoint('render-error');
+		const session = renderer.xr.getSession();
+		if (session) session.end().catch(console.warn);
+		console.error(error);
+	}
 });

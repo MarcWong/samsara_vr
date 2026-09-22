@@ -42,55 +42,77 @@ npx serve .
 
 ## Quest rendering and recovery
 
-The visual reference is `ef18a44f558de35f2753b94fe94bdc46ae8d4cb4`:
-its five octaves per noise layer, cubic noise interpolation, angular gaze
-falloff, palette, drift and highlight shaping are retained. Frequencies too
-fine for the field texture fade toward their mean, rather than disappearing
-and darkening the clouds. Fine grain is reduced to 0.008 and added at eye
-resolution; the periodic sine texture from the first black-screen fix is gone.
+The visual base remains `ef18a44`: five octaves per layer, the palette and
+angular gaze wake. Unresolvable high-frequency noise is filtered toward its
+mean. The full-screen sky uses each eye's inverse projection; it does not use
+a tessellated sphere. Grain is applied after panorama sampling.
 
-Quest/mobile uses a 1536×768 field, built in six horizontal strips. Desktop
-uses 2048×1024 in four strips. Only one strip is shaded each frame, including
-startup and recovery. Quest therefore shades 196,608 heavy pixels per draw,
-compared with 524,288 in the first black-screen fix. This bounds the peak draw;
-it does not imply lower total GPU cost or a measured frame-rate improvement.
+### Ordinary Quest Browser page
 
-Three buffers separate the previous, current and in-progress snapshots. Time,
-trail and palette inputs are frozen throughout each build, so strips meet
-without temporal seams. Only complete panoramas are displayed. Both eyes use
-the same blend between completed snapshots on every frame. At 72 Hz the Quest
-field completes 12 snapshots/second; blending adds roughly one snapshot of
-latency to the slowly evolving field. Head pose itself is rendered every frame.
+The corrected report places the blackout **after entering VR and exploring**.
+The ordinary-page preview also has a separate conservative budget: at most 30 draws/second and 1280×960 canvas pixels (preserving
+aspect ratio). This cap does not limit immersive head tracking. The optional
+DeviceOrientation camera and palette animation continue in the preview.
 
-The eye shader uses cubic B-spline reconstruction (four bilinear reads per
-snapshot) to soften magnified texel boundaries without overshoot. The sky
-reconstructs each eye's world direction from its own inverse projection,
-including asymmetric XR projections, without sphere tessellation. Eye scale
-is 1.0 and fixed foveation is disabled to avoid peripheral tiles. These quality
-improvements add eye-pass cost and require Quest performance validation.
-This remains a procedural sky, not a volumetric scene with motion parallax.
+### Bounded background and eye work
 
-On recoverable WebGL context loss, the page exits VR, shows a recovery message,
-and rebuilds the field at reduced resolution after the browser restores the
-context. Enter VR again after recovery. A browser process killed by the OS
-cannot be recovered by JavaScript; reload the page in that case.
+Mobile uses a 1024×512 field, four strips, and a maximum 48 strip draws/second.
+Only one strip may be submitted per callback, including startup and recovery;
+missed work is never submitted in a catch-up burst. This bounds field work at
+6.29 million pixels/second; the 30 Hz preview caps it lower still. Five octaves
+are retained. Desktop uses a 2048×1024 field and at most 72 strips/second.
 
-### Headset acceptance checks
+Three buffers keep completed snapshots separate from the one being built.
+Time, gaze and palette remain fixed within each panorama. Completed snapshots
+blend each displayed frame, at the cost of some background animation latency.
+Mobile eyes use two total bilinear reads instead of eight cubic reads per
+pixel. Desktop retains cubic reconstruction. Mobile XR scale is 0.85, with
+fixed foveation disabled. Sustained frame misses halve the field update budget
+to 24 strips/second without changing head-pose updates.
 
-- Open the page in Quest Browser and leave it running for at least five minutes.
-- Enter VR, look around and up/down, and check the panorama seam and both eyes.
-- Turn quickly: the view must track every frame while the flow wake eases behind.
-- Exit/re-enter VR and suspend/resume the browser. Check that rendering continues.
-- Record headset frame times and any browser/GPU errors if blackouts persist.
+### Smooth gradients
 
-Desktop automation cannot establish Quest GPU performance or headset comfort.
+Fields use RGBA16F when `EXT_color_buffer_float` is available, avoiding the
+8-bit intermediate quantization that can create contour bands in cloud
+colour gradients. Three mobile fields require 12 MiB, below the regression's
+13.5 MiB of 1536×768 byte fields. If floating-point render targets are unavailable,
+the byte field is dithered **before** quantization. Both paths also retain
+subtle output grain. This targets colour banding; the reported on-headset
+rings still need a device-side comparison to confirm their cause.
 
-### Local validation of the quality revision
+### Recovery and diagnostics
 
-- Chrome renders the desktop and Quest user-agent configurations without
-  JavaScript or shader errors; both simulated asymmetric eye projections draw.
-- A frozen field rendered in six strips matches a full draw byte-for-byte.
-- Simulated WebGL context loss restores both configurations at reduced size.
-- In a fixed forward view at time zero, the revised Quest field differs from
-  the reference by an average 0.87 per RGB channel on a 0–255 scale. This checks
-  broad visual fidelity, not headset aliasing, motion comfort or performance.
+Recoverable WebGL context loss exits VR and shows a fallback. Field resources
+are disposed while the context is still lost, removing stale Three.js disposal
+listeners before restoration; disposing their old framebuffer handles after
+restoration had produced INVALID_OPERATION in the XR recovery test. Restored
+fields are rebuilt smaller and keep the reduced work budget. Render/shader
+exceptions stop the failing loop, show a reload message and record the error. JavaScript cannot
+recover an OS-killed browser process or force the browser to restore a context.
+
+Append `?diagnostics=1` to the page URL to show the current and previous run.
+`window.flowDiagnostics` exposes the same information for remote inspection.
+The version tag is `quest-budget-v3`. Frame progress, texture format, reduced
+work status and loss/error events are stored locally every three seconds and
+on important events. Nothing is sent to a server. Previous-run data is retained
+in memory after reload so a missing loss event can be distinguished from a
+reported context loss or JavaScript exception. A missing event alone does not
+prove a GPU watchdog reset. The script URL is versioned to avoid testing an
+older cached module after deployment.
+
+### Validation
+
+Browser checks cover desktop/mobile shader compilation, matching whole/strip
+renders, asymmetric eye projections, simulated context recovery and persisted
+recovery diagnostics. A mocked XR session also exercises Three.js’s actual
+XRProjectionLayer and XRWebGLLayer paths while turning the head, including
+context loss during a session and re-entry after recovery. This checks our
+XR integration, but not an actual headset driver or compositor. Supplementary
+ordinary-page tests cover 75 seconds of colour changes and 30 seconds on the
+byte-texture compatibility path.
+These desktop tests do not emulate Quest's GPU, browser compositor or display.
+
+On Quest, enter VR and explore with repeated head turns for at least two
+minutes; inspect the broad cloud gradients throughout the panorama.
+Check exit/re-entry and browser suspend/resume. If a failure recurs, reload
+with diagnostics enabled and inspect the previous run before further reloads.
